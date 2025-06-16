@@ -1,0 +1,12 @@
+name = "transferable-test"
+compatibility_date = "2025-06-16"
+main = "example.ts"
+dev.port = 3000
+
+[[durable_objects.bindings]]
+name = "EXAMPLE_DO"
+class_name = "ExampleDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ExampleDO"]
