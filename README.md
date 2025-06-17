@@ -15,7 +15,7 @@ export class ExampleDO extends DurableObject {
 }
 ```
 
-Now your DO gets `/import` and `/export` endpoints made accessible in its fetch. See example below on how this can be used.
+Now your DO gets `/import` and `/export` endpoints made accessible in its fetch. See example below on how this can be used..
 
 # Example
 
