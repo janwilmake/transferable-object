@@ -3,6 +3,11 @@ compatibility_date = "2025-06-16"
 main = "example.ts"
 dev.port = 3000
 
+[[r2_buckets]]
+bucket_name = "myr2bucket"
+binding = "MY_R2_BUCKET"
+experimental_remote = true
+
 [[durable_objects.bindings]]
 name = "EXAMPLE_DO"
 class_name = "ExampleDO"

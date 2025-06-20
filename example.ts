@@ -1,8 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
-import { Transferable } from "./transferable-object";
+import { Transfer, TransferInterface } from "./transferable-object";
 
-@Transferable
+// add this if you also want to add fetch middleware
+// @Transferable
 export class ExampleDO extends DurableObject {
+  transfer: TransferInterface = new Transfer(this); // This will be injected by the decorator
+
   constructor(ctx: DurableObjectState, env: any) {
     super(ctx, env);
 
@@ -29,18 +32,39 @@ export class ExampleDO extends DurableObject {
     }
   }
 
-  fetch() {
-    const users = this.ctx.storage.sql.exec("SELECT * FROM users").toArray();
-    return new Response(
-      "Hello,world!\n\n" + JSON.stringify(users, undefined, 2),
-    );
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/my-custom-export") {
+      // Use the transfer functionality
+      return this.transfer.getExport({
+        includeSchema: true,
+        replaceInserts: true,
+      });
+    }
+
+    if (url.pathname === "/backup-to-r2") {
+      const result = await this.transfer.dump({
+        bucketName: "MY_R2_BUCKET",
+        key: `backups.sql`,
+        exportConfig: {
+          dropTablesIfExist: false,
+          addTransaction: true,
+        },
+      });
+
+      return new Response(JSON.stringify(result));
+    }
+
+    // Your regular DO logic here
+    return new Response("Hello from DO!");
   }
 }
 
 // Worker handler
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
-    const doId = env.EXAMPLE_DO.idFromName("example2");
+    const doId = env.EXAMPLE_DO.idFromName("example3");
     const doStub = env.EXAMPLE_DO.get(doId);
     return doStub.fetch(request);
   },

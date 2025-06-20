@@ -1,11 +1,11 @@
 {
   "name": "transferable-object",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "main": "transferable-object.ts",
   "files": [
     "transferable-object.ts"
   ],
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250614.0"
+    "@cloudflare/workers-types": "^4.20250620.0"
   }
 }
