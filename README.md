@@ -45,10 +45,10 @@ export class MyDurableObject extends DurableObject {
 Add transfer functionality to your existing Durable Object:
 
 ```typescript
-import { Transfer, TransferInterface } from "./transferable-object";
+import { Transfer } from "./transferable-object";
 
 export class MyDurableObject extends DurableObject {
-  transfer: TransferInterface = new Transfer(this);
+  transfer = new Transfer(this);
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);

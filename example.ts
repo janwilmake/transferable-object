@@ -1,10 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
-import { Transfer, TransferInterface } from "./transferable-object";
+import { Transfer } from "./transferable-object";
 
 // add this if you also want to add fetch middleware
 // @Transferable
 export class ExampleDO extends DurableObject {
-  transfer: TransferInterface = new Transfer(this); // This will be injected by the decorator
+  transfer = new Transfer(this);
+
+  async alarm() {
+    // STREAMS .sql FILE TO R2!!!
+    await this.transfer.dump({
+      bucketName: "MY_R2_BUCKET",
+      key: `daily-db-dump.sql`,
+    });
+  }
 
   constructor(ctx: DurableObjectState, env: any) {
     super(ctx, env);
@@ -46,11 +54,7 @@ export class ExampleDO extends DurableObject {
     if (url.pathname === "/backup-to-r2") {
       const result = await this.transfer.dump({
         bucketName: "MY_R2_BUCKET",
-        key: `backups.sql`,
-        exportConfig: {
-          dropTablesIfExist: false,
-          addTransaction: true,
-        },
+        key: `daily-backup.sql`,
       });
 
       return new Response(JSON.stringify(result));
