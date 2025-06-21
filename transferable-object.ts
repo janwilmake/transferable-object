@@ -21,7 +21,7 @@ export interface ExportConfig {
 }
 
 export interface DumpConfig {
-  bucketName: string;
+  r2BucketBindingName: string;
   key: string;
   exportConfig?: ExportConfig;
 }
@@ -36,7 +36,12 @@ export interface ImportResult {
 
 // Transfer class that provides all functionality
 export class Transfer {
-  constructor(private durableObject: DurableObject) {}
+  sql: SqlStorage;
+
+  constructor(private durableObject: DurableObject) {
+    //@ts-ignore (it works idk why complain)
+    this.sql = durableObject.ctx.storage.sql;
+  }
 
   // Export database as SQL dump with comprehensive config
   async getExport(config: ExportConfig = {}): Promise<Response> {
@@ -64,9 +69,7 @@ export class Transfer {
             if (comments) {
               controller.enqueue(
                 new TextEncoder().encode(
-                  `-- Database Export\n-- Generated: ${new Date().toISOString()}\n-- Durable Object ID: ${
-                    this.durableObject.ctx.id
-                  }\n\n`,
+                  `-- Database Export\n-- Generated: ${new Date().toISOString()}\n\n\n`,
                 ),
               );
             }
@@ -107,7 +110,7 @@ export class Transfer {
           writeHeader();
 
           // Get all tables (excluding SQLite system tables)
-          const allTables = this.durableObject.ctx.storage.sql
+          const allTables = this.sql
             .exec(
               `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
             )
@@ -153,7 +156,7 @@ export class Transfer {
               }
 
               // Get CREATE TABLE statement
-              const createStmt = this.durableObject.ctx.storage.sql
+              const createStmt = this.sql
                 .exec(
                   `SELECT sql FROM sqlite_master WHERE type='table' AND name = ?`,
                   tableName,
@@ -172,7 +175,7 @@ export class Transfer {
             }
 
             // Export indexes
-            const indexes = this.durableObject.ctx.storage.sql
+            const indexes = this.sql
               .exec(
                 `SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL`,
               )
@@ -205,7 +208,7 @@ export class Transfer {
               }
 
               // Get column info for proper escaping
-              const columns = this.durableObject.ctx.storage.sql
+              const columns = this.sql
                 .exec(`PRAGMA table_info(${tableName})`)
                 .toArray()
                 .map((col) => col.name as string);
@@ -215,7 +218,7 @@ export class Transfer {
               let batchCount = 0;
 
               while (true) {
-                const rows = this.durableObject.ctx.storage.sql
+                const rows = this.sql
                   .exec(
                     `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
                     batchSize,
@@ -366,12 +369,16 @@ export class Transfer {
   async dump(
     config: DumpConfig,
   ): Promise<{ success: boolean; key: string; size: number }> {
-    const { bucketName, key, exportConfig = {} } = config;
+    const { r2BucketBindingName, key, exportConfig = {} } = config;
 
     // Get the bucket
-    const bucket = (this.durableObject.env as any)[bucketName];
+    const bucket = ((this.durableObject as any).env as any)[
+      r2BucketBindingName
+    ];
     if (!bucket) {
-      throw new Error(`R2 bucket '${bucketName}' not found in environment`);
+      throw new Error(
+        `R2 bucket '${r2BucketBindingName}' not found in environment`,
+      );
     }
 
     // Pass 1: Calculate exact size by generating the export and measuring it
@@ -395,9 +402,8 @@ export class Transfer {
       },
       customMetadata: {
         "exported-at": new Date().toISOString(),
-        "durable-object-id": this.durableObject.ctx.id.toString(),
-        "database-size":
-          this.durableObject.ctx.storage.sql.databaseSize.toString(),
+        "durable-object-id": (this.durableObject as any).id?.toString(),
+        "database-size": this.sql.databaseSize.toString(),
         "export-size": exactSize.toString(),
       },
     });
@@ -426,13 +432,42 @@ export class Transfer {
     };
   }
 
+  // Helper function to parse SQL statements from text
+  parseSQLStatements(text: string): string[] {
+    const statements: string[] = [];
+    const lines = text.split("\n");
+    let currentStatement = "";
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+
+      // Skip comments and empty lines
+      if (trimmedLine.startsWith("--") || trimmedLine === "") {
+        continue;
+      }
+
+      currentStatement += line + "\n";
+
+      // If line ends with semicolon, we have a complete statement
+      if (trimmedLine.endsWith(";")) {
+        const stmt = currentStatement.trim();
+        if (stmt) {
+          statements.push(stmt);
+        }
+        currentStatement = "";
+      }
+    }
+
+    return statements;
+  }
+
   private executeStatement(statement: string): {
     error?: string;
     tableCreated?: string;
     rowsAffected?: number;
   } {
     try {
-      const result = this.durableObject.ctx.storage.sql.exec(statement);
+      const result = this.sql.exec(statement);
 
       // Check if this created a table
       const createTableMatch = statement.match(
@@ -441,7 +476,7 @@ export class Transfer {
       const tableCreated = createTableMatch ? createTableMatch[1] : undefined;
 
       // Get rows affected for INSERT/UPDATE/DELETE
-      const rowsAffected = result.changes || 0;
+      const rowsAffected = result.rowsWritten || 0;
 
       return { tableCreated, rowsAffected };
     } catch (error) {

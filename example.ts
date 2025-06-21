@@ -9,7 +9,7 @@ export class ExampleDO extends DurableObject {
   async alarm() {
     // STREAMS .sql FILE TO R2!!!
     await this.transfer.dump({
-      bucketName: "MY_R2_BUCKET",
+      r2BucketBindingName: "MY_R2_BUCKET",
       key: `daily-db-dump.sql`,
     });
   }
@@ -53,7 +53,7 @@ export class ExampleDO extends DurableObject {
 
     if (url.pathname === "/backup-to-r2") {
       const result = await this.transfer.dump({
-        bucketName: "MY_R2_BUCKET",
+        r2BucketBindingName: "MY_R2_BUCKET",
         key: `daily-backup.sql`,
       });
 
