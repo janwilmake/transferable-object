@@ -1,21 +1,15 @@
 // @ts-check
 /// <reference lib="esnext" />
 /// <reference types="@cloudflare/workers-types" />
-// 2-pass implementation. see https://lmpify.com/httpspastebincon-hgdpah0
 
 import { DurableObject } from "cloudflare:workers";
 
 // Configuration interfaces
 export interface ExportConfig {
-  dropTablesIfExist?: boolean;
   includeSchema?: boolean;
   includeData?: boolean;
   tableWhitelist?: string[];
   tableBlacklist?: string[];
-  addTransaction?: boolean;
-  disableForeignKeyChecks?: boolean;
-  insertIgnore?: boolean;
-  replaceInserts?: boolean;
   batchSize?: number;
   comments?: boolean;
 }
@@ -32,208 +26,450 @@ export interface ImportResult {
   errors?: string[];
   tablesCreated?: string[];
   rowsInserted?: number;
+  warnings?: string[];
+}
+
+export interface TransferableConfig {
+  secret?: string;
+  isReadonlyPublic?: boolean;
+}
+
+export interface CloneConfig {
+  clearOnImport?: boolean;
+  clearAfterExport?: boolean;
+  exportBasicAuth?: string;
+  importBasicAuth?: string;
+}
+
+// Safe query execution result
+interface QueryResult {
+  success: boolean;
+  error?: string;
+  warning?: string;
+  tableCreated?: string;
+  rowsAffected?: number;
+  query?: string;
+}
+
+// Utility function for cloning between DO instances
+export async function clone(
+  exportUrl: string,
+  importUrl: string,
+  config: CloneConfig = {},
+): Promise<{
+  success: boolean;
+  exportResult?: any;
+  importResult?: ImportResult;
+  clearResults?: any;
+  error?: string;
+}> {
+  try {
+    const {
+      clearOnImport = false,
+      clearAfterExport = false,
+      exportBasicAuth,
+      importBasicAuth,
+    } = config;
+
+    // Clear destination if requested
+    if (clearOnImport) {
+      const clearHeaders: HeadersInit = { "Content-Type": "application/json" };
+      if (importBasicAuth) {
+        clearHeaders["Authorization"] = `Basic ${btoa(importBasicAuth)}`;
+      }
+
+      const clearResponse = await fetch(`${importUrl}/transfer/clear`, {
+        method: "POST",
+        headers: clearHeaders,
+      });
+
+      if (!clearResponse.ok) {
+        throw new Error(`Clear import failed: ${clearResponse.statusText}`);
+      }
+    }
+
+    // Export from source
+    const exportHeaders: HeadersInit = {};
+    if (exportBasicAuth) {
+      exportHeaders["Authorization"] = `Basic ${btoa(exportBasicAuth)}`;
+    }
+
+    const exportResponse = await fetch(`${exportUrl}/transfer/export`, {
+      headers: exportHeaders,
+    });
+
+    if (!exportResponse.ok) {
+      throw new Error(`Export failed: ${exportResponse.statusText}`);
+    }
+
+    // Import to destination
+    const importHeaders: HeadersInit = { "Content-Type": "application/sql" };
+    if (importBasicAuth) {
+      importHeaders["Authorization"] = `Basic ${btoa(importBasicAuth)}`;
+    }
+
+    const importResponse = await fetch(`${importUrl}/transfer/import`, {
+      method: "POST",
+      headers: importHeaders,
+      body: exportResponse.body,
+    });
+
+    if (!importResponse.ok) {
+      throw new Error(`Import failed: ${importResponse.statusText}`);
+    }
+
+    const importResult: ImportResult = await importResponse.json();
+
+    // Clear source if requested
+    let clearAfterResult;
+    if (clearAfterExport) {
+      const clearHeaders: HeadersInit = { "Content-Type": "application/json" };
+      if (exportBasicAuth) {
+        clearHeaders["Authorization"] = `Basic ${btoa(exportBasicAuth)}`;
+      }
+
+      const clearResponse = await fetch(`${exportUrl}/transfer/clear`, {
+        method: "POST",
+        headers: clearHeaders,
+      });
+
+      if (!clearResponse.ok) {
+        console.warn(`Clear after export failed: ${clearResponse.statusText}`);
+      } else {
+        clearAfterResult = await clearResponse.json();
+      }
+    }
+
+    return {
+      success: importResult.success,
+      importResult,
+      clearResults: clearAfterResult,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Clone operation failed: ${String(error)}`,
+    };
+  }
 }
 
 // Transfer class that provides all functionality
 export class Transfer {
-  sql: SqlStorage;
+  storage: DurableObjectStorage;
+  private config: TransferableConfig;
 
-  constructor(private durableObject: DurableObject) {
+  constructor(
+    private durableObject: DurableObject,
+    config: TransferableConfig = {},
+  ) {
     //@ts-ignore (it works idk why complain)
-    this.sql = durableObject.ctx.storage.sql;
+    this.storage = durableObject.ctx.storage;
+    this.config = config;
+  }
+
+  // Authentication helper
+  checkAuth(request: Request, requireAuth: boolean = true): boolean {
+    if (!this.config.secret) return true; // No auth configured
+    if (!requireAuth && this.config.isReadonlyPublic) return true; // Readonly public access
+
+    const authHeader = request.headers.get("Authorization");
+    if (!authHeader || !authHeader.startsWith("Basic ")) {
+      return false;
+    }
+
+    try {
+      const credentials = atob(authHeader.slice(6));
+      return credentials === this.config.secret;
+    } catch {
+      return false;
+    }
+  }
+
+  unauthorizedResponse(): Response {
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": 'Basic realm="Transferable DO"',
+        "Content-Type": "text/plain",
+      },
+    });
+  }
+
+  // Safe query execution with detailed error reporting
+  private safeExec(query: string, ...params: any[]): QueryResult {
+    try {
+      const result = this.storage.sql.exec(query, ...params);
+      return {
+        success: true,
+        rowsAffected: result.rowsWritten || 0,
+        query: query.substring(0, 100) + (query.length > 100 ? "..." : ""),
+      };
+    } catch (error) {
+      const errorMsg = `Query failed: "${query.substring(0, 100)}${
+        query.length > 100 ? "..." : ""
+      }" - Error: ${String(error)}`;
+      console.error(errorMsg);
+
+      if (String(error).includes("SQLITE_AUTH")) {
+        return {
+          success: false,
+          error: `SQLITE_AUTH: Operation not permitted - ${errorMsg}`,
+          query: query,
+        };
+      }
+
+      return {
+        success: false,
+        error: errorMsg,
+        query: query,
+      };
+    }
+  }
+
+  // Safe query for data retrieval
+  private safeQuery(
+    query: string,
+    ...params: any[]
+  ): { success: boolean; data?: any[]; error?: string; query?: string } {
+    try {
+      const result = this.storage.sql.exec(query, ...params);
+      return {
+        success: true,
+        data: result.toArray(),
+        query: query.substring(0, 100) + (query.length > 100 ? "..." : ""),
+      };
+    } catch (error) {
+      const errorMsg = `Query failed: "${query.substring(0, 100)}${
+        query.length > 100 ? "..." : ""
+      }" - Error: ${String(error)}`;
+      console.error(errorMsg);
+      return {
+        success: false,
+        error: errorMsg,
+        query: query,
+      };
+    }
+  }
+
+  // Get table list safely
+  private getTableList(): string[] {
+    const result = this.safeQuery(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
+    );
+    if (!result.success || !result.data) {
+      console.warn("Could not retrieve table list, using empty list");
+      return [];
+    }
+    return result.data.map((row: any) => row.name as string);
+  }
+
+  // Get table schema safely
+  private getTableSchema(tableName: string): string | null {
+    const result = this.safeQuery(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name = ?`,
+      tableName,
+    );
+    if (!result.success || !result.data || result.data.length === 0) {
+      console.warn(`Could not retrieve schema for table: ${tableName}`);
+      return null;
+    }
+    return result.data[0].sql as string;
+  }
+
+  // Get table columns safely
+  private getTableColumns(tableName: string): string[] {
+    const result = this.safeQuery(`PRAGMA table_info(${tableName})`);
+    if (!result.success || !result.data) {
+      console.warn(
+        `Could not retrieve columns for table: ${tableName}, using SELECT * approach`,
+      );
+      // Fallback: try to get one row and extract column names
+      const sampleResult = this.safeQuery(`SELECT * FROM ${tableName} LIMIT 1`);
+      if (
+        sampleResult.success &&
+        sampleResult.data &&
+        sampleResult.data.length > 0
+      ) {
+        return Object.keys(sampleResult.data[0]);
+      }
+      return [];
+    }
+    return result.data.map((col: any) => col.name as string);
+  }
+
+  // Clear all data from the DO instance
+  async clear(): Promise<{
+    success: boolean;
+  }> {
+    await this.storage.deleteAll({});
+    return { success: true };
+  }
+
+  // Import from URL that streams SQL
+  async importFromUrl(url: string, auth?: string): Promise<ImportResult> {
+    try {
+      const headers: HeadersInit = {};
+      if (auth) {
+        headers["Authorization"] = `Basic ${btoa(auth)}`;
+      }
+
+      const response = await fetch(url, { headers });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch from ${url}: ${response.statusText}`);
+      }
+
+      // Create a new request with the response body
+      const importRequest = new Request("http://dummy", {
+        method: "POST",
+        body: response.body,
+        headers: { "Content-Type": "application/sql" },
+      });
+
+      return await this.runFromFile(importRequest);
+    } catch (error) {
+      return {
+        success: false,
+        executedStatements: 0,
+        errors: [`Import from URL failed: ${String(error)}`],
+      };
+    }
   }
 
   // Export database as SQL dump with comprehensive config
   async getExport(config: ExportConfig = {}): Promise<Response> {
     const {
-      dropTablesIfExist = false,
       includeSchema = true,
       includeData = true,
       tableWhitelist = [],
       tableBlacklist = [],
-      addTransaction = true,
-      disableForeignKeyChecks = false,
-      insertIgnore = false,
-      replaceInserts = false,
       batchSize = 1000,
       comments = true,
     } = config;
 
     let exportedTables: string[] = [];
     let totalRows = 0;
+    let warnings: string[] = [];
 
     const readable = new ReadableStream({
       start: (controller) => {
         try {
+          const writeText = (text: string) => {
+            controller.enqueue(new TextEncoder().encode(text));
+          };
+
           const writeHeader = () => {
             if (comments) {
-              controller.enqueue(
-                new TextEncoder().encode(
-                  `-- Database Export\n-- Generated: ${new Date().toISOString()}\n\n\n`,
-                ),
+              writeText(
+                `-- Database Export (Simplified)\n-- Generated: ${new Date().toISOString()}\n`,
               );
-            }
-
-            if (disableForeignKeyChecks) {
-              controller.enqueue(
-                new TextEncoder().encode("PRAGMA foreign_keys = OFF;\n\n"),
-              );
-            }
-
-            if (addTransaction) {
-              controller.enqueue(
-                new TextEncoder().encode("BEGIN TRANSACTION;\n\n"),
+              writeText(
+                `-- Note: Transactions and PRAGMA statements removed for compatibility\n\n`,
               );
             }
           };
 
           const writeFooter = () => {
-            if (addTransaction) {
-              controller.enqueue(new TextEncoder().encode("\nCOMMIT;\n"));
-            }
-
-            if (disableForeignKeyChecks) {
-              controller.enqueue(
-                new TextEncoder().encode("PRAGMA foreign_keys = ON;\n"),
-              );
-            }
-
             if (comments) {
-              controller.enqueue(
-                new TextEncoder().encode(
-                  `\n-- Export completed\n-- Tables: ${exportedTables.length}\n-- Total rows: ${totalRows}\n`,
-                ),
+              writeText(
+                `\n-- Export completed\n-- Tables: ${exportedTables.length}\n-- Total rows: ${totalRows}\n`,
               );
+              if (warnings.length > 0) {
+                writeText(
+                  `-- Warnings:\n${warnings
+                    .map((w) => `-- ${w}`)
+                    .join("\n")}\n`,
+                );
+              }
             }
           };
 
           writeHeader();
 
-          // Get all tables (excluding SQLite system tables)
-          const allTables = this.sql
-            .exec(
-              `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
-            )
-            .toArray();
+          // Get all tables safely
+          const allTables = this.getTableList();
+          if (allTables.length === 0) {
+            warnings.push("No tables found or could not access table list");
+          }
 
           // Filter tables based on whitelist/blacklist
-          const tables = allTables.filter((table) => {
-            const tableName = table.name as string;
-
+          const tables = allTables.filter((tableName) => {
             if (tableWhitelist.length > 0) {
               return tableWhitelist.includes(tableName);
             }
-
             if (tableBlacklist.length > 0) {
               return !tableBlacklist.includes(tableName);
             }
-
             return true;
           });
 
-          exportedTables = tables.map((t) => t.name as string);
+          exportedTables = tables;
 
           // Export schema
           if (includeSchema) {
-            for (const table of tables) {
-              const tableName = table.name as string;
-
+            for (const tableName of tables) {
               if (comments) {
-                controller.enqueue(
-                  new TextEncoder().encode(
-                    `\n-- Table structure for ${tableName}\n`,
-                  ),
-                );
+                writeText(`\n-- Table structure for ${tableName}\n`);
               }
 
-              // Drop table if requested
-              if (dropTablesIfExist) {
-                controller.enqueue(
-                  new TextEncoder().encode(
-                    `DROP TABLE IF EXISTS ${tableName};\n`,
-                  ),
-                );
-              }
-
-              // Get CREATE TABLE statement
-              const createStmt = this.sql
-                .exec(
-                  `SELECT sql FROM sqlite_master WHERE type='table' AND name = ?`,
-                  tableName,
-                )
-                .one();
-
-              let sql = createStmt.sql as string;
-              if (!dropTablesIfExist) {
-                sql = sql.replace(
+              const schemaSQL = this.getTableSchema(tableName);
+              if (schemaSQL) {
+                // Convert to CREATE TABLE IF NOT EXISTS for safer imports
+                const safeSQL = schemaSQL.replace(
                   /CREATE TABLE\s+/i,
                   "CREATE TABLE IF NOT EXISTS ",
                 );
+                writeText(`${safeSQL};\n\n`);
+              } else {
+                warnings.push(
+                  `Could not export schema for table: ${tableName}`,
+                );
+                if (comments) {
+                  writeText(
+                    `-- Warning: Could not export schema for ${tableName}\n\n`,
+                  );
+                }
               }
-
-              controller.enqueue(new TextEncoder().encode(`${sql};\n\n`));
-            }
-
-            // Export indexes
-            const indexes = this.sql
-              .exec(
-                `SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL`,
-              )
-              .toArray();
-
-            if (indexes.length > 0 && comments) {
-              controller.enqueue(new TextEncoder().encode(`-- Indexes\n`));
-            }
-
-            for (const index of indexes) {
-              controller.enqueue(new TextEncoder().encode(`${index.sql};\n`));
-            }
-
-            if (indexes.length > 0) {
-              controller.enqueue(new TextEncoder().encode("\n"));
             }
           }
 
           // Export data
           if (includeData) {
-            for (const table of tables) {
-              const tableName = table.name as string;
-
+            for (const tableName of tables) {
               if (comments) {
-                controller.enqueue(
-                  new TextEncoder().encode(
-                    `\n-- Data for table ${tableName}\n`,
-                  ),
-                );
+                writeText(`\n-- Data for table ${tableName}\n`);
               }
 
-              // Get column info for proper escaping
-              const columns = this.sql
-                .exec(`PRAGMA table_info(${tableName})`)
-                .toArray()
-                .map((col) => col.name as string);
+              // Get column info
+              const columns = this.getTableColumns(tableName);
+              if (columns.length === 0) {
+                warnings.push(
+                  `Could not export data for table: ${tableName} - no columns found`,
+                );
+                continue;
+              }
 
               // Stream data in batches
               let offset = 0;
-              let batchCount = 0;
+              let tableRowCount = 0;
 
               while (true) {
-                const rows = this.sql
-                  .exec(
-                    `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
-                    batchSize,
-                    offset,
-                  )
-                  .toArray();
+                const dataResult = this.safeQuery(
+                  `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
+                  batchSize,
+                  offset,
+                );
 
+                if (!dataResult.success) {
+                  warnings.push(
+                    `Failed to export data from ${tableName}: ${dataResult.error}`,
+                  );
+                  break;
+                }
+
+                const rows = dataResult.data || [];
                 if (rows.length === 0) break;
 
                 // Build batch INSERT
-                const insertType = replaceInserts
-                  ? "REPLACE"
-                  : insertIgnore
-                  ? "INSERT OR IGNORE"
-                  : "INSERT";
                 const values = rows.map((row) => {
                   const rowValues = columns.map((col) => {
                     const val = (row as any)[col];
@@ -251,29 +487,29 @@ export class Transfer {
                   return `(${rowValues.join(", ")})`;
                 });
 
-                const insertStmt = `${insertType} INTO ${tableName} (${columns.join(
+                const insertStmt = `INSERT OR IGNORE INTO ${tableName} (${columns.join(
                   ", ",
                 )}) VALUES\n${values.join(",\n")};\n`;
-                controller.enqueue(new TextEncoder().encode(insertStmt));
+                writeText(insertStmt);
 
+                tableRowCount += rows.length;
                 totalRows += rows.length;
                 offset += batchSize;
-                batchCount++;
-
-                // Add some spacing between large batches
-                if (batchCount % 10 === 0) {
-                  controller.enqueue(new TextEncoder().encode("\n"));
-                }
               }
 
-              controller.enqueue(new TextEncoder().encode("\n"));
+              if (comments && tableRowCount > 0) {
+                writeText(
+                  `-- ${tableRowCount} rows inserted into ${tableName}\n\n`,
+                );
+              }
             }
           }
 
           writeFooter();
           controller.close();
         } catch (error) {
-          controller.error(error);
+          console.error("Export stream error:", error);
+          controller.error(new Error(`Export failed: ${String(error)}`));
         }
       },
     });
@@ -284,6 +520,7 @@ export class Transfer {
         "Content-Disposition": 'attachment; filename="database_export.sql"',
         "X-Exported-Tables": exportedTables.join(","),
         "X-Total-Rows": totalRows.toString(),
+        "X-Warnings": warnings.length.toString(),
       },
     });
   }
@@ -299,6 +536,7 @@ export class Transfer {
     let buffer = "";
     let executedStatements = 0;
     let errors: string[] = [];
+    let warnings: string[] = [];
     let tablesCreated: string[] = [];
     let rowsInserted = 0;
 
@@ -311,11 +549,12 @@ export class Transfer {
           if (buffer.trim()) {
             const statements = this.parseSQLStatements(buffer);
             for (const stmt of statements) {
-              const result = this.executeStatement(stmt);
+              const result = this.executeStatementSafely(stmt);
               executedStatements++;
               if (result.error) {
                 errors.push(result.error);
               } else {
+                if (result.warning) warnings.push(result.warning);
                 if (result.tableCreated)
                   tablesCreated.push(result.tableCreated);
                 if (result.rowsAffected) rowsInserted += result.rowsAffected;
@@ -335,11 +574,12 @@ export class Transfer {
           buffer = buffer.substring(lastSemicolon + 1);
 
           for (const stmt of statements) {
-            const result = this.executeStatement(stmt);
+            const result = this.executeStatementSafely(stmt);
             executedStatements++;
             if (result.error) {
               errors.push(result.error);
             } else {
+              if (result.warning) warnings.push(result.warning);
               if (result.tableCreated) tablesCreated.push(result.tableCreated);
               if (result.rowsAffected) rowsInserted += result.rowsAffected;
             }
@@ -351,6 +591,7 @@ export class Transfer {
         success: errors.length === 0,
         executedStatements,
         errors: errors.length > 0 ? errors : undefined,
+        warnings: warnings.length > 0 ? warnings : undefined,
         tablesCreated,
         rowsInserted,
       };
@@ -358,7 +599,8 @@ export class Transfer {
       return {
         success: false,
         executedStatements,
-        errors: [...errors, String(error)],
+        errors: [...errors, `Import stream error: ${String(error)}`],
+        warnings: warnings.length > 0 ? warnings : undefined,
         tablesCreated,
         rowsInserted,
       };
@@ -366,70 +608,87 @@ export class Transfer {
   }
 
   // Dump to R2 bucket with exact sizing using 2-pass approach
-  async dump(
-    config: DumpConfig,
-  ): Promise<{ success: boolean; key: string; size: number }> {
+  async dump(config: DumpConfig): Promise<{
+    success: boolean;
+    key: string;
+    size: number;
+    warnings?: string[];
+  }> {
     const { r2BucketBindingName, key, exportConfig = {} } = config;
 
-    // Get the bucket
-    const bucket = ((this.durableObject as any).env as any)[
-      r2BucketBindingName
-    ];
-    if (!bucket) {
-      throw new Error(
-        `R2 bucket '${r2BucketBindingName}' not found in environment`,
-      );
-    }
-
-    // Pass 1: Calculate exact size by generating the export and measuring it
-    const sizeCalculationResponse = await this.getExport(exportConfig);
-    const sizeCalculationReader = sizeCalculationResponse.body!.getReader();
-
-    let exactSize = 0;
-    while (true) {
-      const { done, value } = await sizeCalculationReader.read();
-      if (done) break;
-      exactSize += value.length;
-    }
-
-    // Pass 2: Create FixedLengthStream with exact size and stream the export
-    const { readable, writable } = new FixedLengthStream(exactSize);
-
-    // Start R2 upload with the readable side
-    const uploadPromise = bucket.put(key, readable, {
-      httpMetadata: {
-        contentType: "application/sql",
-      },
-      customMetadata: {
-        "exported-at": new Date().toISOString(),
-        "durable-object-id": (this.durableObject as any).id?.toString(),
-        "database-size": this.sql.databaseSize.toString(),
-        "export-size": exactSize.toString(),
-      },
-    });
-
-    // Stream the export to the writable side
-    const writer = writable.getWriter();
-    const exportResponse = await this.getExport(exportConfig);
-    const exportReader = exportResponse.body!.getReader();
-
     try {
-      while (true) {
-        const { done, value } = await exportReader.read();
-        if (done) break;
-        await writer.write(value);
+      // Get the bucket
+      const bucket = ((this.durableObject as any).env as any)?.[
+        r2BucketBindingName
+      ];
+      if (!bucket) {
+        throw new Error(
+          `R2 bucket '${r2BucketBindingName}' not found in environment`,
+        );
       }
-    } finally {
-      await writer.close();
+
+      // Pass 1: Calculate exact size by generating the export and measuring it
+      const sizeCalculationResponse = await this.getExport(exportConfig);
+      const sizeCalculationReader = sizeCalculationResponse.body!.getReader();
+
+      let exactSize = 0;
+      while (true) {
+        const { done, value } = await sizeCalculationReader.read();
+        if (done) break;
+        exactSize += value.length;
+      }
+
+      // Pass 2: Create FixedLengthStream with exact size and stream the export
+      const { readable, writable } = new FixedLengthStream(exactSize);
+
+      // Start R2 upload with the readable side
+      const uploadPromise = bucket.put(key, readable, {
+        httpMetadata: {
+          contentType: "application/sql",
+        },
+        customMetadata: {
+          "exported-at": new Date().toISOString(),
+          "durable-object-id": (this.durableObject as any).id?.toString(),
+          "export-size": exactSize.toString(),
+        },
+      });
+
+      // Stream the export to the writable side
+      const writer = writable.getWriter();
+      const exportResponse = await this.getExport(exportConfig);
+      const exportReader = exportResponse.body!.getReader();
+
+      try {
+        while (true) {
+          const { done, value } = await exportReader.read();
+          if (done) break;
+          await writer.write(value);
+        }
+      } finally {
+        await writer.close();
+      }
+
+      const result = await uploadPromise;
+      const warnings = exportResponse.headers.get("X-Warnings");
+
+      return {
+        success: true,
+        key: result.key,
+        size: exactSize,
+        warnings:
+          warnings && parseInt(warnings) > 0
+            ? ["Export completed with warnings"]
+            : undefined,
+      };
+    } catch (error) {
+      console.error("Dump error:", error);
+      return {
+        success: false,
+        key: "",
+        size: 0,
+        warnings: [`Dump failed: ${String(error)}`],
+      };
     }
-
-    const result = await uploadPromise;
-
-    return {
-      success: true,
-      key: result.key,
-      size: exactSize,
-    };
   }
 
   // Helper function to parse SQL statements from text
@@ -461,29 +720,42 @@ export class Transfer {
     return statements;
   }
 
-  private executeStatement(statement: string): {
-    error?: string;
-    tableCreated?: string;
-    rowsAffected?: number;
-  } {
-    try {
-      const result = this.sql.exec(statement);
+  private executeStatementSafely(statement: string): QueryResult {
+    const trimmedStatement = statement.trim();
 
-      // Check if this created a table
-      const createTableMatch = statement.match(
-        /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i,
-      );
-      const tableCreated = createTableMatch ? createTableMatch[1] : undefined;
-
-      // Get rows affected for INSERT/UPDATE/DELETE
-      const rowsAffected = result.rowsWritten || 0;
-
-      return { tableCreated, rowsAffected };
-    } catch (error) {
+    // Skip known problematic statements
+    if (trimmedStatement.match(/^(BEGIN|COMMIT|ROLLBACK|PRAGMA)/i)) {
       return {
-        error: `Error executing: ${statement.substring(0, 50)}...: ${error}`,
+        success: true,
+        warning: `Skipped unsupported statement: ${trimmedStatement.substring(
+          0,
+          50,
+        )}...`,
       };
     }
+
+    // Skip DROP statements if they might cause issues
+    if (trimmedStatement.match(/^DROP\s+TABLE/i)) {
+      return {
+        success: true,
+        warning: `Skipped DROP TABLE statement: ${trimmedStatement.substring(
+          0,
+          50,
+        )}...`,
+      };
+    }
+
+    const result = this.safeExec(statement);
+
+    // Check if this created a table
+    const createTableMatch = statement.match(
+      /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i,
+    );
+    if (createTableMatch && result.success) {
+      result.tableCreated = createTableMatch[1];
+    }
+
+    return result;
   }
 }
 
@@ -491,87 +763,133 @@ export class Transfer {
 export interface TransferInterface {
   getExport(config?: ExportConfig): Promise<Response>;
   runFromFile(request: Request): Promise<ImportResult>;
-  dump(
-    config: DumpConfig,
-  ): Promise<{ success: boolean; key: string; size: number }>;
+  dump(config: DumpConfig): Promise<{
+    success: boolean;
+    key: string;
+    size: number;
+    warnings?: string[];
+  }>;
+  clear(): Promise<{
+    success: boolean;
+    tablesDropped: string[];
+    errors?: string[];
+  }>;
+  importFromUrl(url: string, auth?: string): Promise<ImportResult>;
 }
 
 // Decorator function that adds transferable functionality
 export function Transferable<T extends new (...args: any[]) => DurableObject>(
-  constructor: T,
+  config: TransferableConfig = {},
 ) {
-  return class extends constructor {
-    public transfer: Transfer;
+  return function (constructor: T) {
+    return class extends constructor {
+      public transfer: Transfer;
 
-    constructor(...args: any[]) {
-      super(...args);
-      this.transfer = new Transfer(this);
-    }
-
-    // Override fetch to check for transfer endpoints
-    async fetch(request: Request): Promise<Response> {
-      const url = new URL(request.url);
-
-      // Handle transfer endpoints
-      if (url.pathname === "/transfer/export" && request.method === "GET") {
-        const config = this.parseExportConfig(url.searchParams);
-        return this.transfer.getExport(config);
+      constructor(...args: any[]) {
+        super(...args);
+        this.transfer = new Transfer(this, config);
       }
 
-      if (url.pathname === "/transfer/import" && request.method === "POST") {
-        const result = await this.transfer.runFromFile(request);
-        return new Response(JSON.stringify(result), {
-          headers: { "Content-Type": "application/json" },
-          status: result.success ? 200 : 400,
-        });
-      }
+      // Override fetch to check for transfer endpoints
+      async fetch(request: Request): Promise<Response> {
+        const url = new URL(request.url);
 
-      if (url.pathname === "/transfer/dump" && request.method === "POST") {
         try {
-          const config: DumpConfig = await request.json();
-          const result = await this.transfer.dump(config);
-          return new Response(JSON.stringify(result), {
-            headers: { "Content-Type": "application/json" },
-          });
+          // Determine if this is a readonly operation
+          const isReadonly =
+            request.method === "GET" && url.pathname === "/transfer/export";
+
+          // Check authentication
+          if (!this.transfer.checkAuth(request, !isReadonly)) {
+            return this.transfer.unauthorizedResponse();
+          }
+
+          // Handle transfer endpoints
+          if (url.pathname === "/transfer/export" && request.method === "GET") {
+            const config = this.parseExportConfig(url.searchParams);
+            return this.transfer.getExport(config);
+          }
+
+          if (
+            url.pathname === "/transfer/import" &&
+            request.method === "POST"
+          ) {
+            const result = await this.transfer.runFromFile(request);
+            return new Response(JSON.stringify(result), {
+              headers: { "Content-Type": "application/json" },
+              status: result.success ? 200 : 400,
+            });
+          }
+
+          // New endpoint: /transfer/import/{url}
+          const importUrlMatch = url.pathname.match(
+            /^\/transfer\/import\/(.+)$/,
+          );
+          if (importUrlMatch && request.method === "POST") {
+            const importUrl = decodeURIComponent(importUrlMatch[1]);
+            const authHeader = request.headers.get("Authorization");
+            const auth = authHeader?.toLowerCase()?.startsWith("basic ")
+              ? atob(authHeader.slice("basic ".length))
+              : undefined;
+
+            const result = await this.transfer.importFromUrl(importUrl, auth);
+            return new Response(JSON.stringify(result), {
+              headers: { "Content-Type": "application/json" },
+              status: result.success ? 200 : 400,
+            });
+          }
+
+          // New endpoint: /transfer/clear
+          if (url.pathname === "/transfer/clear" && request.method === "POST") {
+            const result = await this.transfer.clear();
+            return new Response(JSON.stringify(result), {
+              headers: { "Content-Type": "application/json" },
+              status: result.success ? 200 : 500,
+            });
+          }
+
+          if (url.pathname === "/transfer/dump" && request.method === "POST") {
+            const config: DumpConfig = await request.json();
+            const result = await this.transfer.dump(config);
+            return new Response(JSON.stringify(result), {
+              headers: { "Content-Type": "application/json" },
+              status: result.success ? 200 : 500,
+            });
+          }
+
+          // Call original fetch if it exists and is overridden
+          if (super.fetch !== DurableObject.prototype.fetch) {
+            return super.fetch(request);
+          }
+
+          return new Response("Not found", { status: 404 });
         } catch (error) {
+          console.error("Transfer endpoint error:", error);
           return new Response(
             JSON.stringify({
               success: false,
-              error: String(error),
+              error: `Transfer operation failed: ${String(error)}`,
             }),
             {
-              status: 400,
+              status: 500,
               headers: { "Content-Type": "application/json" },
             },
           );
         }
       }
 
-      // Call original fetch if it exists and is overridden
-      if (super.fetch !== DurableObject.prototype.fetch) {
-        return super.fetch(request);
+      private parseExportConfig(params: URLSearchParams): ExportConfig {
+        return {
+          includeSchema: params.get("includeSchema") !== "false",
+          includeData: params.get("includeData") !== "false",
+          tableWhitelist:
+            params.get("tableWhitelist")?.split(",").filter(Boolean) || [],
+          tableBlacklist:
+            params.get("tableBlacklist")?.split(",").filter(Boolean) || [],
+          batchSize: parseInt(params.get("batchSize") || "1000"),
+          comments: params.get("comments") !== "false",
+        };
       }
-
-      return new Response("Not found", { status: 404 });
-    }
-
-    private parseExportConfig(params: URLSearchParams): ExportConfig {
-      return {
-        dropTablesIfExist: params.get("dropTablesIfExist") === "true",
-        includeSchema: params.get("includeSchema") !== "false",
-        includeData: params.get("includeData") !== "false",
-        tableWhitelist:
-          params.get("tableWhitelist")?.split(",").filter(Boolean) || [],
-        tableBlacklist:
-          params.get("tableBlacklist")?.split(",").filter(Boolean) || [],
-        addTransaction: params.get("addTransaction") !== "false",
-        disableForeignKeyChecks:
-          params.get("disableForeignKeyChecks") === "true",
-        insertIgnore: params.get("insertIgnore") === "true",
-        replaceInserts: params.get("replaceInserts") === "true",
-        batchSize: parseInt(params.get("batchSize") || "1000"),
-        comments: params.get("comments") !== "false",
-      };
-    }
-  } as any;
+    } as any;
+  };
 }

@@ -1,117 +1,110 @@
 # Transferable Object
 
-A comprehensive database import/export library for Cloudflare Durable Objects with SQLite storage. Supports streaming SQL dumps, R2 backups, and flexible import/export configurations.
-
-## Features
-
-- **SQL Export**: Stream database as SQL dump with comprehensive configuration options
-- **SQL Import**: Import from SQL files with streaming support
-- **R2 Backup**: Direct backup to R2 with exact size calculation using 2-pass approach
-- **Flexible Configuration**: Table filtering, transaction wrapping, batch processing, and more
-- **Two Usage Patterns**: Decorator or manual instantiation
+A database import/export library for Cloudflare Durable Objects with SQLite storage. Supports streaming SQL dumps, R2 backups, cross-DO cloning, and authentication.
 
 ## Installation
 
-```
+```bash
 npm i transferable-object
 ```
 
-## Usage
+## Quick Start
 
-### Option 1: Using @Transferable Decorator
-
-The decorator automatically adds transfer endpoints to your Durable Object's fetch handler:
+### Decorator Pattern (Recommended)
 
 ```typescript
-import { Transferable } from "./transferable-object";
+import { Transferable } from "transferable-object";
 
-@Transferable
+@Transferable({ secret: "user:pass", isReadonlyPublic: true })
 export class MyDurableObject extends DurableObject {
-  // Automatically adds these endpoints:
-  // GET /transfer/export - Export database as SQL
-  // POST /transfer/import - Import from SQL file
-  // POST /transfer/dump - Backup to R2
+  // Automatically adds transfer endpoints
 }
 ```
 
-**Added endpoints:**
-
-- `GET /transfer/export?includeSchema=true&batchSize=1000` - Export with query params
-- `POST /transfer/import` - Import SQL file from request body
-- `POST /transfer/dump` - Backup to R2 (requires JSON config in body)
-
-### Option 2: Manual Integration
-
-Add transfer functionality to your existing Durable Object:
+### Manual Integration
 
 ```typescript
-import { Transfer } from "./transferable-object";
+import { Transfer } from "transferable-object";
 
 export class MyDurableObject extends DurableObject {
-  transfer = new Transfer(this);
+  transfer = new Transfer(this, { secret: "user:pass" });
 
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    // Custom export endpoint
+  async fetch(request: Request) {
     if (url.pathname === "/backup") {
-      return this.transfer.getExport({
-        includeSchema: true,
-        replaceInserts: true,
-      });
+      return this.transfer.getExport();
     }
-
-    // Backup to R2
-    if (url.pathname === "/backup-to-r2") {
-      const result = await this.transfer.dump({
-        bucketName: "MY_R2_BUCKET",
-        key: `backup-${Date.now()}.sql`,
-      });
-      return Response.json(result);
-    }
-
-    // Your existing logic...
+    // ... your logic
   }
 }
 ```
 
-## API Reference
+## Endpoints (Decorator)
 
-### `getExport(config?: ExportConfig): Promise<Response>`
+- `GET /transfer/export` - Export as SQL dump
+- `POST /transfer/import` - Import from SQL body
+- `POST /transfer/clear` - Clear all data
+- `POST /transfer/dump` - Backup to R2
 
-Exports database as streaming SQL dump.
+## API Methods
 
-**Config options:**
-
-- `dropTablesIfExist` - Add DROP TABLE statements
-- `includeSchema` - Include table structure (default: true)
-- `includeData` - Include table data (default: true)
-- `tableWhitelist/tableBlacklist` - Filter tables
-- `addTransaction` - Wrap in transaction (default: true)
-- `batchSize` - Rows per INSERT batch (default: 1000)
-- `replaceInserts` - Use REPLACE instead of INSERT
-- `insertIgnore` - Use INSERT OR IGNORE
-
-### `runFromFile(request: Request): Promise<ImportResult>`
-
-Imports SQL from request body stream.
-
-### `dump(config: DumpConfig): Promise<{success, key, size}>`
-
-Backs up database to R2 bucket with exact size calculation.
-
-**Config:**
+### Export
 
 ```typescript
-{
-  bucketName: string;    // R2 bucket environment variable name
-  key: string;           // Object key in bucket
-  exportConfig?: ExportConfig;  // Optional export configuration
-}
+await transfer.getExport({
+  includeSchema: true, // Include CREATE TABLE
+  includeData: true, // Include INSERT statements
+  tableWhitelist: [], // Only these tables
+  tableBlacklist: [], // Exclude these tables
+  batchSize: 1000, // Rows per INSERT
+  comments: true, // Add SQL comments
+});
 ```
 
-## Requirements
+### Import
 
-- Cloudflare Workers with Durable Objects
-- R2 bucket binding (for dump functionality)
-- SQLite storage in Durable Object
+```typescript
+await transfer.runFromFile(request);
+await transfer.importFromUrl("https://other-do/transfer/export", "user:pass");
+```
+
+### R2 Backup
+
+```typescript
+await transfer.dump({
+  r2BucketBindingName: "MY_BUCKET",
+  key: `backup-${Date.now()}.sql`,
+  exportConfig: { ... }
+});
+```
+
+### Clone Between DOs
+
+```typescript
+import { clone } from "transferable-object";
+
+await clone(
+  "https://source-do/transfer/export",
+  "https://dest-do/transfer/import",
+  {
+    clearOnImport: true,
+    exportBasicAuth: "user:pass",
+    importBasicAuth: "user:pass",
+  },
+);
+```
+
+## Authentication
+
+Configure with `secret` option. Supports Basic Auth (`user:pass`).
+
+- `isReadonlyPublic: true` - Allow unauthenticated exports
+- All other operations require authentication when secret is set
+
+## Features
+
+- **Streaming**: Handles large databases efficiently
+- **Safe Execution**: Comprehensive error handling and recovery
+- **Cross-DO Cloning**: Direct database migration between instances
+- **R2 Integration**: Fixed-size streaming backups
+- **Flexible Filtering**: Table whitelist/blacklist support
+- **Authentication**: Basic Auth with readonly public option
