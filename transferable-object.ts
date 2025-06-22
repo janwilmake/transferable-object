@@ -301,6 +301,10 @@ export class Transfer {
   async clear(): Promise<{
     success: boolean;
   }> {
+    const alarm = await this.storage.getAlarm();
+    if (alarm) {
+      await this.storage.deleteAlarm();
+    }
     await this.storage.deleteAll({});
     return { success: true };
   }
