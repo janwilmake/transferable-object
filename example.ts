@@ -45,10 +45,7 @@ export class ExampleDO extends DurableObject {
 
     if (url.pathname === "/my-custom-export") {
       // Use the transfer functionality
-      return this.transfer.getExport({
-        includeSchema: true,
-        replaceInserts: true,
-      });
+      return this.transfer.getExport();
     }
 
     if (url.pathname === "/backup-to-r2") {
