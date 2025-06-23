@@ -1,11 +1,14 @@
 {
   "name": "transferable-object",
-  "version": "0.0.13",
+  "version": "0.0.16",
   "main": "transferable-object.ts",
   "files": [
     "transferable-object.ts"
   ],
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250620.0"
+  },
+  "dependencies": {
+    "remote-sql-cursor": "^0.1.5"
   }
 }

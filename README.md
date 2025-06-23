@@ -1,110 +1,84 @@
 # Transferable Object
 
-A database import/export library for Cloudflare Durable Objects with SQLite storage. Supports streaming SQL dumps, R2 backups, cross-DO cloning, and authentication.
+A database import/export library for Cloudflare Durable Objects with SQLite storage. Enables cross-DO data transfer using streaming SQL cursors.
 
 ## Installation
 
 ```bash
-npm i transferable-object
+npm i transferable-object remote-sql-cursor
 ```
 
-## Quick Start
+## Usage
 
-### Decorator Pattern (Recommended)
+**⚠️ Important: `@Streamable()` decorator is required for both patterns**
+
+### Pattern 1: Decorator (Recommended)
 
 ```typescript
+import { Streamable } from "remote-sql-cursor";
 import { Transferable } from "transferable-object";
 
-@Transferable({ secret: "user:pass", isReadonlyPublic: true })
+@Streamable()
+@Transferable({ secret: "user:pass" })
 export class MyDurableObject extends DurableObject {
-  // Automatically adds transfer endpoints
+  // Automatically adds transfer endpoints:
+  // GET /transfer/import/{url} - Import from remote DO
+  // POST /transfer/clear - Clear all data
 }
 ```
 
-### Manual Integration
+### Pattern 2: Manual Integration
 
 ```typescript
+import { Streamable } from "remote-sql-cursor";
 import { Transfer } from "transferable-object";
 
+@Streamable()
 export class MyDurableObject extends DurableObject {
   transfer = new Transfer(this, { secret: "user:pass" });
 
   async fetch(request: Request) {
-    if (url.pathname === "/backup") {
-      return this.transfer.getExport();
+    const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/transfer/")) {
+      // Handle auth
+      if (!this.transfer.checkAuth(request)) {
+        return this.transfer.unauthorizedResponse();
+      }
+
+      // Import from URL
+      if (url.pathname.match(/^\/transfer\/import\/(.+)$/)) {
+        const sourceUrl = decodeURIComponent(RegExp.$1);
+        const result = await this.transfer.importFromUrl(sourceUrl);
+        return Response.json(result);
+      }
+
+      // Clear data
+      if (url.pathname === "/transfer/clear" && request.method === "POST") {
+        const result = await this.transfer.clear();
+        return Response.json(result);
+      }
     }
-    // ... your logic
+
+    // Your existing logic...
   }
 }
 ```
 
-## Endpoints (Decorator)
-
-- `GET /transfer/export` - Export as SQL dump
-- `POST /transfer/import` - Import from SQL body
-- `POST /transfer/clear` - Clear all data
-- `POST /transfer/dump` - Backup to R2
-
-## API Methods
-
-### Export
-
-```typescript
-await transfer.getExport({
-  includeSchema: true, // Include CREATE TABLE
-  includeData: true, // Include INSERT statements
-  tableWhitelist: [], // Only these tables
-  tableBlacklist: [], // Exclude these tables
-  batchSize: 1000, // Rows per INSERT
-  comments: true, // Add SQL comments
-});
-```
-
-### Import
-
-```typescript
-await transfer.runFromFile(request);
-await transfer.importFromUrl("https://other-do/transfer/export", "user:pass");
-```
-
-### R2 Backup
-
-```typescript
-await transfer.dump({
-  r2BucketBindingName: "MY_BUCKET",
-  key: `backup-${Date.now()}.sql`,
-  exportConfig: { ... }
-});
-```
-
-### Clone Between DOs
+## Cross-DO Cloning
 
 ```typescript
 import { clone } from "transferable-object";
 
-await clone(
-  "https://source-do/transfer/export",
-  "https://dest-do/transfer/import",
-  {
-    clearOnImport: true,
-    exportBasicAuth: "user:pass",
-    importBasicAuth: "user:pass",
-  },
-);
+await clone("https://source-do-url", "https://dest-do-url", {
+  clearOnImport: true,
+  exportBasicAuth: "user:pass",
+  importBasicAuth: "user:pass",
+});
 ```
 
 ## Authentication
 
-Configure with `secret` option. Supports Basic Auth (`user:pass`).
-
-- `isReadonlyPublic: true` - Allow unauthenticated exports
-- All other operations require authentication when secret is set
-
-## Features
-
-- **Streaming**: Handles large databases efficiently
-- **Safe Execution**: Comprehensive error handling and recovery
-- **Cross-DO Cloning**: Direct database migration between instances
-- **R2 Integration**: Fixed-size streaming backups
-- **Flexible Filtering**: Table whitelist/blacklist support
-- **Authentication**: Basic Auth with readonly public option
+- Uses Basic Auth when `secret` is configured
+- `isReadonlyPublic: true` - Allow unauthenticated read operations
+- Pass credentials via `Authorization` header or `?apiKey=` query param
