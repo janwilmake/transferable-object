@@ -3,7 +3,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { DurableObject } from "cloudflare:workers";
-import { exec, makeStub, StreamableHandler } from "remote-sql-cursor";
+import { exec, makeStub } from "remote-sql-cursor";
 
 export interface ImportResult {
   success: boolean;
