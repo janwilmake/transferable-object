@@ -10,8 +10,6 @@ export interface ExportConfig {
   includeData?: boolean;
   tableWhitelist?: string[];
   tableBlacklist?: string[];
-  batchSize?: number;
-  comments?: boolean;
 }
 
 export interface DumpConfig {
@@ -173,16 +171,21 @@ export class Transfer {
     if (!requireAuth && this.config.isReadonlyPublic) return true; // Readonly public access
 
     const authHeader = request.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Basic ")) {
-      return false;
+    let credentials = undefined;
+    if (authHeader && authHeader.startsWith("Basic")) {
+      try {
+        credentials = atob(authHeader.slice(6));
+      } catch {}
     }
 
-    try {
-      const credentials = atob(authHeader.slice(6));
-      return credentials === this.config.secret;
-    } catch {
-      return false;
+    const apiKeyQueryParam = new URL(request.url).searchParams.get("apiKey");
+    if (credentials === this.config.secret) {
+      return true;
     }
+    if (apiKeyQueryParam === this.config.secret) {
+      return true;
+    }
+    return false;
   }
 
   unauthorizedResponse(): Response {
@@ -254,7 +257,7 @@ export class Transfer {
   // Get table list safely
   private getTableList(): string[] {
     const result = this.safeQuery(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
+      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'`,
     );
     if (!result.success || !result.data) {
       console.warn("Could not retrieve table list, using empty list");
@@ -339,6 +342,41 @@ export class Transfer {
     }
   }
 
+  // Helper function to escape SQL values
+  private escapeSQLValue(value: any): string {
+    if (value === null || value === undefined) {
+      return "NULL";
+    }
+
+    if (typeof value === "string") {
+      // Escape single quotes by doubling them
+      return `'${value.replace(/'/g, "''")}'`;
+    }
+
+    if (typeof value === "number") {
+      return String(value);
+    }
+
+    if (typeof value === "boolean") {
+      return value ? "1" : "0";
+    }
+
+    if (value instanceof ArrayBuffer) {
+      return `X'${Array.from(new Uint8Array(value))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("")}'`;
+    }
+
+    if (value instanceof Uint8Array) {
+      return `X'${Array.from(value)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("")}'`;
+    }
+
+    // For any other type, convert to string and escape
+    return `'${String(value).replace(/'/g, "''")}'`;
+  }
+
   // Export database as SQL dump with comprehensive config
   async getExport(config: ExportConfig = {}): Promise<Response> {
     const {
@@ -346,9 +384,10 @@ export class Transfer {
       includeData = true,
       tableWhitelist = [],
       tableBlacklist = [],
-      batchSize = 1000,
-      comments = true,
     } = config;
+
+    const BATCH_SIZE = 10000;
+    const MAX_STATEMENT_SIZE = 100 * 1024; // 100KB
 
     let exportedTables: string[] = [];
     let totalRows = 0;
@@ -362,34 +401,25 @@ export class Transfer {
           };
 
           const writeHeader = () => {
-            if (comments) {
-              writeText(
-                `-- Database Export (Simplified)\n-- Generated: ${new Date().toISOString()}\n`,
-              );
-              writeText(
-                `-- Note: Transactions and PRAGMA statements removed for compatibility\n\n`,
-              );
-            }
+            writeText(
+              `-- Database Export\n-- Generated: ${new Date().toISOString()}\n\n`,
+            );
           };
 
           const writeFooter = () => {
-            if (comments) {
+            writeText(
+              `\n-- Export completed\n-- Tables: ${exportedTables.length}\n-- Total rows: ${totalRows}\n`,
+            );
+            if (warnings.length > 0) {
               writeText(
-                `\n-- Export completed\n-- Tables: ${exportedTables.length}\n-- Total rows: ${totalRows}\n`,
+                `-- Warnings:\n${warnings.map((w) => `-- ${w}`).join("\n")}\n`,
               );
-              if (warnings.length > 0) {
-                writeText(
-                  `-- Warnings:\n${warnings
-                    .map((w) => `-- ${w}`)
-                    .join("\n")}\n`,
-                );
-              }
             }
           };
 
           writeHeader();
 
-          // Get all tables safely
+          // Get all tables safely (excluding _cf_ tables by default)
           const allTables = this.getTableList();
           if (allTables.length === 0) {
             warnings.push("No tables found or could not access table list");
@@ -411,9 +441,7 @@ export class Transfer {
           // Export schema
           if (includeSchema) {
             for (const tableName of tables) {
-              if (comments) {
-                writeText(`\n-- Table structure for ${tableName}\n`);
-              }
+              writeText(`\n-- Table structure for ${tableName}\n`);
 
               const schemaSQL = this.getTableSchema(tableName);
               if (schemaSQL) {
@@ -427,11 +455,9 @@ export class Transfer {
                 warnings.push(
                   `Could not export schema for table: ${tableName}`,
                 );
-                if (comments) {
-                  writeText(
-                    `-- Warning: Could not export schema for ${tableName}\n\n`,
-                  );
-                }
+                writeText(
+                  `-- Warning: Could not export schema for ${tableName}\n\n`,
+                );
               }
             }
           }
@@ -439,71 +465,98 @@ export class Transfer {
           // Export data
           if (includeData) {
             for (const tableName of tables) {
-              if (comments) {
-                writeText(`\n-- Data for table ${tableName}\n`);
-              }
+              writeText(`\n-- Data for table ${tableName}\n`);
 
-              // Get column info
-              const columns = this.getTableColumns(tableName);
-              if (columns.length === 0) {
-                warnings.push(
-                  `Could not export data for table: ${tableName} - no columns found`,
-                );
-                continue;
-              }
-
-              // Stream data in batches
-              let offset = 0;
-              let tableRowCount = 0;
-
-              while (true) {
-                const dataResult = this.safeQuery(
-                  `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
-                  batchSize,
-                  offset,
-                );
-
-                if (!dataResult.success) {
+              try {
+                // Get column info
+                const columns = this.getTableColumns(tableName);
+                if (columns.length === 0) {
                   warnings.push(
-                    `Failed to export data from ${tableName}: ${dataResult.error}`,
+                    `Could not export data for table: ${tableName} - no columns found`,
                   );
-                  break;
+                  continue;
                 }
 
-                const rows = dataResult.data || [];
-                if (rows.length === 0) break;
+                // Stream data using cursor
+                let tableRowCount = 0;
+                let offset = 0;
 
-                // Build batch INSERT
-                const values = rows.map((row) => {
-                  const rowValues = columns.map((col) => {
-                    const val = (row as any)[col];
-                    if (val === null) return "NULL";
-                    if (typeof val === "string") {
-                      return `'${val.replace(/'/g, "''")}'`;
+                while (true) {
+                  let currentStatementSize = 0;
+                  let currentValues: string[] = [];
+                  let batchRowCount = 0;
+
+                  // Build batch until we hit size limit or batch size
+                  const result = this.storage.sql.exec(
+                    `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
+                    BATCH_SIZE,
+                    offset,
+                  );
+
+                  // Process rows one by one
+                  for (const row of result) {
+                    const rowValues = columns.map((col) => {
+                      return this.escapeSQLValue((row as any)[col]);
+                    });
+
+                    const valueString = `(${rowValues.join(", ")})`;
+                    const valueStringSize = new TextEncoder().encode(
+                      valueString,
+                    ).length;
+
+                    // Check if adding this row would exceed our statement size limit
+                    if (
+                      currentValues.length > 0 &&
+                      currentStatementSize + valueStringSize >
+                        MAX_STATEMENT_SIZE
+                    ) {
+                      // Write current batch
+                      const insertStmt = `INSERT OR IGNORE INTO ${tableName} (${columns.join(
+                        ", ",
+                      )}) VALUES\n${currentValues.join(",\n")};\n`;
+                      writeText(insertStmt);
+
+                      // Reset for next batch
+                      currentValues = [];
+                      currentStatementSize = 0;
                     }
-                    if (val instanceof ArrayBuffer) {
-                      return `X'${Array.from(new Uint8Array(val))
-                        .map((b) => b.toString(16).padStart(2, "0"))
-                        .join("")}'`;
-                    }
-                    return String(val);
-                  });
-                  return `(${rowValues.join(", ")})`;
-                });
 
-                const insertStmt = `INSERT OR IGNORE INTO ${tableName} (${columns.join(
-                  ", ",
-                )}) VALUES\n${values.join(",\n")};\n`;
-                writeText(insertStmt);
+                    currentValues.push(valueString);
+                    currentStatementSize += valueStringSize;
+                    batchRowCount++;
+                    tableRowCount++;
+                    totalRows++;
+                  }
 
-                tableRowCount += rows.length;
-                totalRows += rows.length;
-                offset += batchSize;
-              }
+                  // Write any remaining values
+                  if (currentValues.length > 0) {
+                    const insertStmt = `INSERT OR IGNORE INTO ${tableName} (${columns.join(
+                      ", ",
+                    )}) VALUES\n${currentValues.join(",\n")};\n`;
+                    writeText(insertStmt);
+                  }
 
-              if (comments && tableRowCount > 0) {
+                  // If we got fewer rows than requested, we're done
+                  if (batchRowCount < BATCH_SIZE) {
+                    break;
+                  }
+
+                  offset += BATCH_SIZE;
+                }
+
+                if (tableRowCount > 0) {
+                  writeText(
+                    `-- ${tableRowCount} rows exported from ${tableName}\n\n`,
+                  );
+                }
+              } catch (error) {
+                warnings.push(
+                  `Failed to export data from ${tableName}: ${String(error)}`,
+                );
                 writeText(
-                  `-- ${tableRowCount} rows inserted into ${tableName}\n\n`,
+                  `-- Error exporting data from ${tableName}: ${String(
+                    error,
+                  )}\n\n`,
                 );
               }
             }
@@ -749,6 +802,17 @@ export class Transfer {
       };
     }
 
+    // Skip _cf_ table operations
+    if (trimmedStatement.match(/_cf_/i)) {
+      return {
+        success: true,
+        warning: `Skipped _cf_ table operation: ${trimmedStatement.substring(
+          0,
+          50,
+        )}...`,
+      };
+    }
+
     const result = this.safeExec(statement);
 
     // Check if this created a table
@@ -829,9 +893,9 @@ export function Transferable<T extends new (...args: any[]) => DurableObject>(
           const importUrlMatch = url.pathname.match(
             /^\/transfer\/import\/(.+)$/,
           );
-          if (importUrlMatch && request.method === "POST") {
+          if (importUrlMatch && request.method === "GET") {
             const importUrl = decodeURIComponent(importUrlMatch[1]);
-            const authHeader = request.headers.get("Authorization");
+            const authHeader = request.headers.get("X-Transfer-Auth");
             const auth = authHeader?.toLowerCase()?.startsWith("basic ")
               ? atob(authHeader.slice("basic ".length))
               : undefined;
@@ -890,8 +954,6 @@ export function Transferable<T extends new (...args: any[]) => DurableObject>(
             params.get("tableWhitelist")?.split(",").filter(Boolean) || [],
           tableBlacklist:
             params.get("tableBlacklist")?.split(",").filter(Boolean) || [],
-          batchSize: parseInt(params.get("batchSize") || "1000"),
-          comments: params.get("comments") !== "false",
         };
       }
     } as any;
