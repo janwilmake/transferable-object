@@ -10,7 +10,7 @@ npm i transferable-object remote-sql-cursor
 
 ## Usage
 
-**⚠️ Important: `@Streamable()` decorator is required for both patterns**
+**⚠️ Important: `@Streamable()` decorator is required at the source DO, and the DO needs to be exposed over `fetch` for this to work**
 
 ### Pattern 1: Decorator (Recommended)
 
