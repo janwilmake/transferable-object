@@ -90,7 +90,7 @@ export class Transfer {
   }
 
   // Import from URL using remote-sql-cursor
-  async importFromUrl(url: string, auth?: string): Promise<ImportResult> {
+  async importFromUrl(url: string, authHeader?: string): Promise<ImportResult> {
     const errors: string[] = [];
     const warnings: string[] = [];
     const tablesCreated: string[] = [];
@@ -98,7 +98,7 @@ export class Transfer {
 
     try {
       // Create stub for the remote database
-      const stub = makeStub(url);
+      const stub = makeStub(url, { Authorization: authHeader });
 
       // Step 1: Get all tables from remote database
       console.log("Getting table list from remote database...");
@@ -311,13 +311,13 @@ export function Transferable<T extends new (...args: any[]) => DurableObject>(
           );
           if (importUrlMatch && request.method === "GET") {
             const importUrl = decodeURIComponent(importUrlMatch[1]);
-            const authHeader = request.headers.get("X-Transfer-Auth");
-            const auth = authHeader?.toLowerCase()?.startsWith("basic ")
-              ? atob(authHeader.slice("basic ".length))
-              : undefined;
+            const apiKey = url.searchParams.get("apiKey");
 
-            const result = await this.transfer.importFromUrl(importUrl, auth);
-            return new Response(JSON.stringify(result), {
+            const result = await this.transfer.importFromUrl(
+              importUrl,
+              apiKey ? `Basic ${btoa(apiKey)}` : undefined,
+            );
+            return new Response(JSON.stringify(result, undefined, 2), {
               headers: { "Content-Type": "application/json" },
               status: result.success ? 200 : 400,
             });

@@ -9,6 +9,6 @@
     "@cloudflare/workers-types": "^4.20250620.0"
   },
   "dependencies": {
-    "remote-sql-cursor": "^0.1.5"
+    "remote-sql-cursor": "^0.1.7"
   }
 }
