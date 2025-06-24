@@ -6,7 +6,7 @@
 
 ✅ Tried improving SQLite dump functionality further, found that it's HARD. Created a simplified approach
 
-Expose `/do/{id}` as basepath for any direct DO request (with auth)
+✅ Expose `/do/{id}` as basepath for any direct DO request (with auth)
 
 Test pulling from remote `https://markdownfeed.com/do/v3-pub` and see if this is reliable.
 

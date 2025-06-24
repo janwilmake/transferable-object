@@ -211,7 +211,7 @@ export class Transfer {
               }
 
               // Log progress periodically
-              if (tableRowCount % 1000 === 0) {
+              if (tableRowCount % 1000 === 0 && tableRowCount !== 0) {
                 console.log(
                   `Imported ${tableRowCount} rows to ${tableName}...`,
                 );
@@ -311,11 +311,15 @@ export function Transferable<T extends new (...args: any[]) => DurableObject>(
           );
           if (importUrlMatch && request.method === "GET") {
             const importUrl = decodeURIComponent(importUrlMatch[1]);
-            const apiKey = url.searchParams.get("apiKey");
+            const credentials = url.searchParams.get("credentials");
+            const authHeader = credentials
+              ? `Basic ${btoa(credentials)}`
+              : undefined;
 
+            console.log({ credentials, authHeader });
             const result = await this.transfer.importFromUrl(
               importUrl,
-              apiKey ? `Basic ${btoa(apiKey)}` : undefined,
+              authHeader,
             );
             return new Response(JSON.stringify(result, undefined, 2), {
               headers: { "Content-Type": "application/json" },
