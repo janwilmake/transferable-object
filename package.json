@@ -1,6 +1,6 @@
 {
   "name": "transferable-object",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "main": "transferable-object.ts",
   "files": [
     "transferable-object.ts"

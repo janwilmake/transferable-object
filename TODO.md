@@ -8,7 +8,7 @@
 
 Expose `/do/{id}` as basepath for any direct DO request (with auth)
 
-Test pulling from remote `https://markdownfeed.com/do/v3-pub` and see if this is reliable
+Test pulling from remote `https://markdownfeed.com/do/v3-pub` and see if this is reliable.
 
 Make a post about more robust simplified `transferable-object`.
 
