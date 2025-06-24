@@ -316,7 +316,6 @@ export function Transferable<T extends new (...args: any[]) => DurableObject>(
               ? `Basic ${btoa(credentials)}`
               : undefined;
 
-            console.log({ credentials, authHeader });
             const result = await this.transfer.importFromUrl(
               importUrl,
               authHeader,
